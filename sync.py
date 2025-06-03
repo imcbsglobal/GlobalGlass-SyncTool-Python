@@ -155,7 +155,7 @@ def fetch_data(conn):
 
 
 def clear_and_upload_data(data, config):
-    """Clear existing data and upload new data to web API"""
+    """Clear existing data and upload new data to web API using improved chunking"""
     try:
         api_base_url = config['api']['url']
         api_key = config['api']['key']
@@ -168,54 +168,82 @@ def clear_and_upload_data(data, config):
             'Authorization': f'Bearer {api_key}'
         }
 
-        tables = {
-            "products": "/api/sync/products",
-            "batches": "/api/sync/productbatches", 
-            "masters": "/api/sync/masters",
-            "users": "/api/sync/users"
+        # Define endpoints - using separate clear and chunk endpoints
+        endpoints = {
+            "products": {
+                "clear": "/api/clear/products",
+                "chunk": "/api/sync/products/chunk"
+            },
+            "batches": {
+                "clear": "/api/clear/productbatches", 
+                "chunk": "/api/sync/productbatches/chunk"
+            },
+            "masters": {
+                "clear": "/api/clear/masters",
+                "chunk": "/api/sync/masters/chunk"
+            },
+            "users": {
+                "clear": "/api/clear/users",
+                "chunk": "/api/sync/users/chunk"
+            }
         }
-
-        clear_endpoints = {
-            "products": "/api/sync/products/clear",
-            "batches": "/api/sync/productbatches/clear",
-            "masters": "/api/sync/masters/clear", 
-            "users": "/api/sync/users/clear"
-        }
-
-        # Step 1: Clear existing data
-        print("🗑️  CLEARING EXISTING DATA")
-        print("-" * 50)
         
-        for i, (table_name, clear_endpoint) in enumerate(clear_endpoints.items(), 1):
-            if table_name in data:
-                print(f"{i}. Clearing {table_name}...", end=" ", flush=True)
-                clear_url = f"{api_base_url}{clear_endpoint}"
-                
-                try:
-                    clear_response = requests.delete(clear_url, headers=headers, timeout=30)
-                    if clear_response.status_code != 200:
-                        clear_response = requests.post(clear_url, headers=headers, timeout=30)
-                    
-                    if clear_response.status_code == 200:
-                        print("✅ Success")
-                    else:
-                        print(f"❌ Failed ({clear_response.status_code})")
-                        return False
-                except Exception as e:
-                    print(f"❌ Error: {str(e)}")
-                    return False
-
-        print()
-        
-        # Step 2: Upload new data
-        print("📤 UPLOADING NEW DATA")
-        print("-" * 50)
-        
-        def chunk_data(data_list, chunk_size=500):  # Increased chunk size
+        def chunk_data(data_list, chunk_size=500):
             for i in range(0, len(data_list), chunk_size):
                 yield data_list[i:i + chunk_size]
 
+        def make_request_with_retry(url, data=None, method='POST', retries=3):
+            """Make HTTP request with retry logic"""
+            for retry in range(retries):
+                try:
+                    if method == 'DELETE':
+                        response = requests.delete(url, headers=headers, timeout=60)
+                    else:
+                        response = requests.post(
+                            url,
+                            data=json.dumps(data, cls=DecimalEncoder) if data else None,
+                            headers=headers,
+                            timeout=180
+                        )
+                    
+                    if response.status_code in [200, 204]:
+                        return True, response
+                    else:
+                        print(f"\n   ⚠️  Retry {retry + 1}/{retries} (Status: {response.status_code})")
+                        if retry < retries - 1:
+                            time.sleep(2)
+                        
+                except Exception as e:
+                    print(f"\n   ⚠️  Retry {retry + 1}/{retries} (Error: {str(e)})")
+                    if retry < retries - 1:
+                        time.sleep(2)
+            
+            return False, None
+
         table_names = ["products", "batches", "masters", "users"]
+        
+        # Step 1: Clear all tables first
+        print("🗑️  CLEARING EXISTING DATA")
+        print("-" * 50)
+        
+        for table_index, table_name in enumerate(table_names, 1):
+            if table_name in data and data[table_name]:
+                print(f"{table_index}. Clearing {table_name}...", end=" ", flush=True)
+                
+                clear_url = f"{api_base_url}{endpoints[table_name]['clear']}"
+                success, response = make_request_with_retry(clear_url, method='DELETE')
+                
+                if success:
+                    print("✅ Cleared")
+                else:
+                    print(f"❌ Failed to clear {table_name}")
+                    return False
+        
+        print()
+        
+        # Step 2: Upload all data in chunks
+        print("📤 UPLOADING NEW DATA (CHUNKED)")
+        print("-" * 50)
         
         for table_index, table_name in enumerate(table_names, 1):
             if table_name in data:
@@ -226,35 +254,18 @@ def clear_and_upload_data(data, config):
                     
                 print(f"{table_index}. Uploading {len(table_data):,} {table_name}...")
                 
-                post_url = f"{api_base_url}{tables[table_name]}"
+                chunk_url = f"{api_base_url}{endpoints[table_name]['chunk']}"
                 chunks = list(chunk_data(table_data, chunk_size=500))
                 
                 for chunk_index, chunk in enumerate(chunks, 1):
                     print_progress_bar(chunk_index - 1, len(chunks), f"   Chunk {chunk_index}/{len(chunks)}")
                     
-                    success = False
-                    for retry in range(3):  # 3 retries
-                        try:
-                            response = requests.post(
-                                post_url,
-                                data=json.dumps(chunk, cls=DecimalEncoder),
-                                headers=headers,
-                                timeout=180  # 3 minutes timeout
-                            )
-                            if response.status_code == 200:
-                                success = True
-                                break
-                            else:
-                                print(f"\n   ⚠️  Retry {retry + 1}/3 (Status: {response.status_code})")
-                                time.sleep(2)
-                        except Exception as e:
-                            print(f"\n   ⚠️  Retry {retry + 1}/3 (Error: {str(e)})")
-                            time.sleep(2)
+                    success, response = make_request_with_retry(chunk_url, chunk)
                     
                     print_progress_bar(chunk_index, len(chunks), f"   Chunk {chunk_index}/{len(chunks)}")
                     
                     if not success:
-                        print(f"\n❌ Failed to upload {table_name} after 3 attempts")
+                        print(f"\n❌ Failed to upload chunk {chunk_index} of {table_name}")
                         return False
                 
                 print(f"   ✅ {table_name.title()} uploaded successfully!")
